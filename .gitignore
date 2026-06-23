@@ -1,0 +1,13 @@
+# Caches
+*cache*/
+__pycache__/
+.cache/
+
+# Virtual Environments
+.venv/
+
+# Models
+models*/
+
+# Synthetic Data
+Synthetic*/
