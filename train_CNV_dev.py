@@ -14,8 +14,8 @@ if 'LD_LIBRARY_PATH' not in os.environ or 'site-packages/nvidia' not in os.envir
                 if 'LD_LIBRARY_PATH' in os.environ:
                     new_ld_path += ':' + os.environ['LD_LIBRARY_PATH']
                 os.environ['LD_LIBRARY_PATH'] = new_ld_path
-                # 변경된 환경 변수를 시스템이 인식하도록 현재 스크립트 재실행
-                os.execv(sys.executable, [sys.executable] + sys.argv)
+                if sys.argv and os.path.exists(sys.argv[0]):
+                    os.execv(sys.executable, [sys.executable] + sys.argv)
     except Exception as e:
         print("Warning: Could not automatically set LD_LIBRARY_PATH for NVIDIA libraries:", e)
 # --- NVIDIA GPU 라이브러리 자동 환경 변수 추가 끝 ---
@@ -56,6 +56,8 @@ def get_args():
     parser.add_argument('--rf_n_estimators', type=int, default=100, help='n_estimators for Random Forest')
     parser.add_argument('--rf_max_depth', type=int, default=-1, help='max_depth for Random Forest (-1 for None)')
     parser.add_argument('--iqr_filter', type=str, default='none', choices=['none', 'both', 'normal', 'abnormal'], help='Apply IQR outlier removal on UR column')
+    parser.add_argument('--patience', type=int, default=5, help='Patience for EarlyStopping (default: 5)')
+    parser.add_argument('--min_delta', type=float, default=1e-4, help='Minimum change in val_loss for EarlyStopping (default: 1e-4)')
     return parser.parse_args()
 
 def custom_focal_loss(alpha=0.25, gamma=3.0):
@@ -161,15 +163,26 @@ def main():
         print(f"No {args.category} targets found in Excel.")
         return
 
-    data_dir = 'Synthetic_400K'
+    # data_dir = 'Synthetic_400K'
+    data_dir = 'Synthetic'
     file_prefix = 'duple' if args.category == 'dup' else 'del'
-    files_to_load = [
-        os.path.join(data_dir, f'CNV_{file_prefix}_male_synthetic.csv'),
-        os.path.join(data_dir, f'CNV_{file_prefix}_female_synthetic.csv'),
-        os.path.join(data_dir, 'CNV_normal_male_synthetic.csv'),
-        os.path.join(data_dir, 'CNV_normal_female_synthetic.csv')
-    ]
-    
+
+    if file_prefix == 'duple':
+        files_to_load = [
+            os.path.join(data_dir, f'CNV_{file_prefix}_male_synthetic.csv'),
+            os.path.join(data_dir, f'CNV_{file_prefix}_female_synthetic.csv'),
+            os.path.join(data_dir, 'CNV_normal_male_synthetic.csv'),
+            os.path.join(data_dir, 'CNV_normal_female_synthetic.csv')
+        ]
+
+    else:
+        files_to_load = [
+            os.path.join(data_dir, f'CNV_{file_prefix}_male_synthetic_updated.csv'),
+            os.path.join(data_dir, f'CNV_{file_prefix}_female_synthetic_updated.csv'),
+            os.path.join(data_dir, 'CNV_normal_male_synthetic.csv'),
+            os.path.join(data_dir, 'CNV_normal_female_synthetic.csv')
+        ]
+
     cached_paths = []
     for f in files_to_load:
         base_name = os.path.basename(f).replace('.csv', '')
@@ -205,19 +218,36 @@ def main():
             return pd.read_csv(file_path, skiprows=skip_func)
 
         try:
-            file_prefix = 'duple' if args.category == 'dup' else 'del'
-            files_to_load = [
-                os.path.join(data_dir, f'CNV_{file_prefix}_male_synthetic.csv'),
-                os.path.join(data_dir, f'CNV_{file_prefix}_female_synthetic.csv'),
-                os.path.join(data_dir, 'CNV_normal_male_synthetic.csv'),
-                os.path.join(data_dir, 'CNV_normal_female_synthetic.csv')
-            ]
             
             from multiprocessing import Process
             
             def worker_task(file_path, frac, out_path):
                 if os.path.exists(out_path):
                     print(f"[{os.path.basename(file_path)}] Cache already exists: {os.path.basename(out_path)}. Skipping CSV parsing!")
+                    return
+
+                # If 1.0 parquet already exists, fast downsample directly from it without parsing massive CSVs
+                base_name = os.path.basename(file_path).replace('.csv', '')
+                frac_1_path = os.path.join(data_dir, f"{base_name}_frac_1.0.parquet")
+                if frac < 1.0 and os.path.exists(frac_1_path):
+                    print(f"[{os.path.basename(file_path)}] Fast downsampling from existing {os.path.basename(frac_1_path)}...")
+                    import pyarrow.parquet as pq
+                    from tqdm import tqdm
+                    pf = pq.ParquetFile(frac_1_path)
+                    total_rg = pf.num_row_groups
+                    keep_rg = max(1, int(total_rg * frac))
+                    print(f"[{os.path.basename(file_path)}] Streaming {keep_rg}/{total_rg} row groups directly into cache...")
+                    writer = None
+                    total_rows = 0
+                    for rg_idx in tqdm(range(keep_rg), desc=f"Caching {os.path.basename(out_path)}"):
+                        rg_table = pf.read_row_group(rg_idx)
+                        total_rows += rg_table.num_rows
+                        if writer is None:
+                            writer = pq.ParquetWriter(out_path, rg_table.schema)
+                        writer.write_table(rg_table)
+                    if writer is not None:
+                        writer.close()
+                    print(f"[{os.path.basename(file_path)}] Parquet saved successfully ({total_rows:,} rows).")
                     return
                     
                 print(f"[{os.path.basename(file_path)}] Parsing CSV in chunks -> {os.path.basename(out_path)}...")
@@ -294,6 +324,66 @@ def main():
     else:
         model_dir = f'models_{args.category}_{args.model_type}'
     os.makedirs(model_dir, exist_ok=True)
+    
+    # Generate dataset scale summary markdown file in model directory
+    md_summary_path = os.path.join(model_dir, 'dataset_info.md')
+    pos_m = meta_cnv_m.num_rows
+    pos_f = meta_cnv_f.num_rows
+    pos_total = pos_m + pos_f
+    neg_m = meta_norm_m.num_rows
+    neg_f = meta_norm_f.num_rows
+    neg_total = neg_m + neg_f
+    grand_total = pos_total + neg_total
+    train_samples = int(grand_total * 0.8)
+    test_samples = grand_total - train_samples
+    
+    from datetime import datetime
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    md_content = f"""# Training Dataset Scale & Configuration
+
+- **Created At**: {now_str}
+- **Category**: {args.category.upper()}
+- **Model Type**: {args.model_type}
+- **Downsample Fraction**: {args.downsample_frac}
+- **Total Diseases**: {len(target_info)}
+
+---
+
+## 1. Dataset Scale Summary
+
+| Classification | Subgroup | Number of Samples (Rows) | Proportion |
+| :--- | :--- | :--- | :--- |
+| **CNV Positive (양성)** | Male (남자) | {pos_m:,} | {pos_m / grand_total * 100:.1f}% |
+| | Female (여자) | {pos_f:,} | {pos_f / grand_total * 100:.1f}% |
+| | **Positive Subtotal** | **{pos_total:,}** | **{pos_total / grand_total * 100:.1f}%** |
+| **Normal Negative (음성)** | Male (남자) | {neg_m:,} | {neg_m / grand_total * 100:.1f}% |
+| | Female (여자) | {neg_f:,} | {neg_f / grand_total * 100:.1f}% |
+| | **Negative Subtotal** | **{neg_total:,}** | **{neg_total / grand_total * 100:.1f}%** |
+| **Grand Total (전체)** | **All 4 Groups Combined** | **{grand_total:,}** | **100.0%** |
+
+---
+
+## 2. Train / Test Split (Per Disease Baseline)
+
+- **Train Split (80%)**: ~{train_samples:,} samples
+- **Test Split (20%)**: ~{test_samples:,} samples
+*(Note: Per-disease outlier removal such as IQR filter may slightly adjust final sample counts)*
+
+---
+
+## 3. Training Parameters
+
+- **Compute Device**: {args.device}
+- **Epochs**: {args.epochs}
+- **Batch Size**: {args.batch_size}
+- **Learning Rate**: {args.lr}
+- **Dropout Rate**: {args.dropout}
+- **IQR Filter**: {args.iqr_filter}
+"""
+    with open(md_summary_path, 'w', encoding='utf-8') as f_md:
+        f_md.write(md_content)
+    print(f"Saved dataset scale summary to {md_summary_path}")
     
     schema_cnv_m = set(meta_cnv_m.schema.names)
     schema_cnv_f = set(meta_cnv_f.schema.names)
@@ -554,8 +644,20 @@ def main():
                           loss=custom_focal_loss(),
                           metrics=["accuracy", tf.keras.metrics.Recall(name='sensitivity')])
             
-            early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
-            reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, min_lr=1e-6)
+            early_stopping = tf.keras.callbacks.EarlyStopping(
+                monitor='val_loss',
+                min_delta=args.min_delta,
+                patience=args.patience,
+                restore_best_weights=True,
+                verbose=1
+            )
+            reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(
+                monitor='val_loss',
+                factor=0.5,
+                patience=max(2, args.patience - 2),
+                min_lr=1e-6,
+                verbose=1
+            )
     
             history = model.fit(
                 x=[X_train_dep_scaled, X_train_read_scaled],
@@ -631,6 +733,11 @@ def main():
             'Test_Accuracy': accuracy_str
         })
         pd.DataFrame(validation_results).to_csv(csv_results_path, index=False)
+        
+        if args.model_type == 'dnn':
+            tf.keras.backend.clear_session()
+        del model
+        gc.collect()
 
     print("==================================================")
     print("All sequential training complete!")

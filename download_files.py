@@ -19,16 +19,16 @@ PASSWORD = "DifFkcK9771%@"  # Both proxy and target share this password
 
 # Source remote files
 REMOTE_FILES = [
-    "/BiO/SME_Synthetic_CNV/Thermo_Synthetic/CNV_Synthetic_del/CNV_del_female_synthetic.csv",
-    "/BiO/SME_Synthetic_CNV/Thermo_Synthetic/CNV_Synthetic_del/CNV_del_male_synthetic.csv",
-    "/BiO/SME_Synthetic_CNV/Thermo_Synthetic/CNV_Synthetic_duple/CNV_duple_female_synthetic.csv",
-    "/BiO/SME_Synthetic_CNV/Thermo_Synthetic/CNV_Synthetic_duple/CNV_duple_male_synthetic.csv",
-    "/BiO/SME_Synthetic_CNV/Thermo_Synthetic/CNV_Synthetic_normal/CNV_normal_female_synthetic.csv",
-    "/BiO/SME_Synthetic_CNV/Thermo_Synthetic/CNV_Synthetic_normal/CNV_normal_male_synthetic.csv",
+    "/BiO/SME_Synthetic_CNV/Thermo_Synthetic_Test/CNV_Synthetic_del/CNV_del_female_synthetic.csv",
+    "/BiO/SME_Synthetic_CNV/Thermo_Synthetic_Test/CNV_Synthetic_del/CNV_del_male_synthetic.csv",
+    "/BiO/SME_Synthetic_CNV/Thermo_Synthetic_Test/CNV_Synthetic_duple/CNV_duple_female_synthetic.csv",
+    "/BiO/SME_Synthetic_CNV/Thermo_Synthetic_Test/CNV_Synthetic_duple/CNV_duple_male_synthetic.csv",
+    "/BiO/SME_Synthetic_CNV/Thermo_Synthetic_Test/CNV_Synthetic_normal/CNV_normal_female_synthetic.csv",
+    "/BiO/SME_Synthetic_CNV/Thermo_Synthetic_Test/CNV_Synthetic_normal/CNV_normal_male_synthetic.csv",
 ]
 
 # Destination directory (current workspace)
-LOCAL_DIR = "./Synthetic_400K"
+LOCAL_DIR = "./Synthetic_Test"
 
 def download_file_via_sftp(remote_path, local_path, position):
     file_name = os.path.basename(remote_path)
