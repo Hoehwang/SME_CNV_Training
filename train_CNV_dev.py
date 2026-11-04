@@ -44,11 +44,14 @@ def get_args():
     parser = argparse.ArgumentParser(description="Sequential Two-Branch DNN for Duplication CNV")
     parser.add_argument('--lr', type=float, default=1e-4, help='Initial learning rate')
     parser.add_argument('--dropout', type=float, default=0.3, help='Dropout rate')
-    parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=1024, help='Batch size (default: 1024)')
     parser.add_argument('--epochs', type=int, default=50, help='Number of epochs')
     parser.add_argument('--device', type=str, default='GPU', choices=['GPU', 'CPU'], help='Compute device')
-    parser.add_argument('--downsample_frac', type=float, default=1.0, help='Fraction of data to load (e.g., 0.05)')
-    parser.add_argument('--category', type=str, default='dup', choices=['dup', 'del'], help='Target category (dup or del)')
+    parser.add_argument('--gpu', type=str, default='0', help='Specific GPU index to use (e.g., 0, 1, 2, 3)')
+    parser.add_argument('--downsample_frac', type=float, default=1.0, help='Fraction of data to load (e.g., 0.05 for 400K)')
+    parser.add_argument('--category', type=str, default='dup', choices=['dup', 'del', 'both'], help='Target category (dup, del, or both)')
+    parser.add_argument('--data_dir', type=str, default='Synthetic', help='Dataset directory (default: Synthetic)')
+    parser.add_argument('--model_dir', type=str, default='', help='Custom output model directory (e.g. models_del_dnn_400k)')
     parser.add_argument('--model_type', type=str, default='dnn', choices=['dnn', 'lr', 'autokeras', 'mlp', 'linear', 'nb', 'rf'], help='Model type to use for training')
     parser.add_argument('--ak_max_trials', type=int, default=3, help='Max trials for AutoKeras')
     parser.add_argument('--max_iter', type=int, default=200, help='Max iterations for LR and MLP')
@@ -58,6 +61,9 @@ def get_args():
     parser.add_argument('--iqr_filter', type=str, default='none', choices=['none', 'both', 'normal', 'abnormal'], help='Apply IQR outlier removal on UR column')
     parser.add_argument('--patience', type=int, default=5, help='Patience for EarlyStopping (default: 5)')
     parser.add_argument('--min_delta', type=float, default=1e-4, help='Minimum change in val_loss for EarlyStopping (default: 1e-4)')
+    parser.add_argument('--tag', type=str, default='', help='Suffix tag for model output directory (e.g. es_400k)')
+    parser.add_argument('--overwrite', action='store_true', help='Overwrite existing trained models instead of skipping')
+    parser.add_argument('--memory_growth', action='store_true', default=False, help='Enable GPU memory growth (default: False for maximum speed)')
     return parser.parse_args()
 
 def custom_focal_loss(alpha=0.25, gamma=3.0):
@@ -137,35 +143,18 @@ def train_mlp_classifier(X_train, y_train, X_test, y_test, target_disease, max_i
     
     return clf, loss, accuracy, y_pred_prob, y_pred
 
-def main():
-    args = get_args()
-    
-    if args.device == 'CPU':
-        os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
-        print("Set to use CPU for training.")
-    else:
-        print("Set to use GPU for training.")
-
-    # Load disease info
-    print("Loading disease info from Orphanet_Names_filtered_2604.xlsx...")
-    try:
-        d_info = pd.read_excel('Orphanet_Names_filtered_2604.xlsx')
-    except Exception as e:
-        print(f"Failed to load Orphanet_Names_filtered_2604.xlsx: {e}")
-        return
-        
-    if args.category == 'dup':
+def train_for_category(args, category, d_info):
+    if category == 'dup':
         target_info = d_info[d_info['disease'].str.contains('dup|tetra', na=False, case=False, regex=True)].reset_index(drop=True)
     else:
-        target_info = d_info[d_info['disease'].str.contains(args.category, na=False, case=False)].reset_index(drop=True)
+        target_info = d_info[d_info['disease'].str.contains(category, na=False, case=False)].reset_index(drop=True)
         
     if len(target_info) == 0:
-        print(f"No {args.category} targets found in Excel.")
+        print(f"No {category} targets found in Excel.")
         return
 
-    # data_dir = 'Synthetic_400K'
-    data_dir = 'Synthetic'
-    file_prefix = 'duple' if args.category == 'dup' else 'del'
+    data_dir = args.data_dir
+    file_prefix = 'duple' if category == 'dup' else 'del'
 
     if file_prefix == 'duple':
         files_to_load = [
@@ -317,12 +306,28 @@ def main():
     print(f"Normal negative samples total: {meta_norm_m.num_rows + meta_norm_f.num_rows}")
     
     # Create models output directory
-    if args.model_type in ['lr', 'mlp']:
-        model_dir = f'models_{args.category}_{args.model_type}_iter_{args.max_iter}'
-    elif args.model_type == 'dnn':
-        model_dir = f'models_{args.category}_dnn_epoch_{args.epochs}'
+    if args.model_dir:
+        if '{category}' in args.model_dir:
+            model_dir = args.model_dir.format(category=category)
+        elif args.category == 'both':
+            if '_del_' in args.model_dir or '_dup_' in args.model_dir:
+                model_dir = args.model_dir.replace('_dup_', f'_{category}_').replace('_del_', f'_{category}_')
+            elif args.model_dir.startswith('models_del_') or args.model_dir.startswith('models_dup_'):
+                model_dir = args.model_dir.replace('models_del_', f'models_{category}_').replace('models_dup_', f'models_{category}_')
+            elif args.model_dir.startswith('models_'):
+                model_dir = f"models_{category}_" + args.model_dir[len('models_'):]
+            else:
+                model_dir = f"{args.model_dir}_{category}"
+        else:
+            model_dir = args.model_dir
     else:
-        model_dir = f'models_{args.category}_{args.model_type}'
+        suffix = f"_{args.tag}" if args.tag else (f"_{int(args.downsample_frac * 8000)}k" if args.downsample_frac < 1.0 else "")
+        if args.model_type in ['lr', 'mlp']:
+            model_dir = f'models_{category}_{args.model_type}_iter_{args.max_iter}{suffix}'
+        elif args.model_type == 'dnn':
+            model_dir = f'models_{category}_dnn_epoch_{args.epochs}{suffix}'
+        else:
+            model_dir = f'models_{category}_{args.model_type}{suffix}'
     os.makedirs(model_dir, exist_ok=True)
     
     # Generate dataset scale summary markdown file in model directory
@@ -343,7 +348,7 @@ def main():
     md_content = f"""# Training Dataset Scale & Configuration
 
 - **Created At**: {now_str}
-- **Category**: {args.category.upper()}
+- **Category**: {category.upper()}
 - **Model Type**: {args.model_type}
 - **Downsample Fraction**: {args.downsample_frac}
 - **Total Diseases**: {len(target_info)}
@@ -396,11 +401,11 @@ def main():
     # START SEQUENTIAL LOOP
     total_diseases = len(target_info)
     print(f"==================================================")
-    print(f"Starting sequential training for {total_diseases} {args.category.upper()} diseases.")
+    print(f"Starting sequential training for {total_diseases} {category.upper()} diseases in {model_dir}")
     print(f"==================================================")
 
     validation_results = []
-    csv_results_path = os.path.join(model_dir, f'{args.category}_validation_results.csv')
+    csv_results_path = os.path.join(model_dir, f'{category}_validation_results.csv')
 
     if os.path.exists(csv_results_path):
         try:
@@ -424,7 +429,7 @@ def main():
             model_save_path = os.path.join(model_dir, f"{target_disease}_nb_model.pkl")
         elif args.model_type == 'rf':
             model_save_path = os.path.join(model_dir, f"{target_disease}_rf_model.pkl")
-        if os.path.exists(model_save_path):
+        if os.path.exists(model_save_path) and not args.overwrite:
             print(f"\n---> [{idx+1}/{total_diseases}] Skipping {target_disease}: Model already exists.")
             continue
 
@@ -654,7 +659,8 @@ def main():
             reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(
                 monitor='val_loss',
                 factor=0.5,
-                patience=max(2, args.patience - 2),
+                min_delta=args.min_delta,
+                patience=max(1, args.patience - 1),
                 min_lr=1e-6,
                 verbose=1
             )
@@ -724,7 +730,7 @@ def main():
         
         validation_results.append({
             'Disease': target_disease,
-            'Category': args.category.upper(),
+            'Category': category.upper(),
             'Specificity': specificity,
             'Sensitivity': sensitivity,
             'PPV': ppv,
@@ -740,7 +746,46 @@ def main():
         gc.collect()
 
     print("==================================================")
-    print("All sequential training complete!")
+    print(f"All sequential training complete for {category.upper()}! Results saved to {model_dir}")
+
+def main():
+    args = get_args()
+    
+    if args.device == 'CPU':
+        os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+        print("Set to use CPU for training.")
+    else:
+        gpus = tf.config.list_physical_devices('GPU')
+        if gpus:
+            try:
+                gpu_idx = int(args.gpu)
+                if 0 <= gpu_idx < len(gpus):
+                    tf.config.set_visible_devices(gpus[gpu_idx], 'GPU')
+                    if args.memory_growth:
+                        tf.config.experimental.set_memory_growth(gpus[gpu_idx], True)
+                    print(f"Set to use GPU {args.gpu} for training (memory growth: {args.memory_growth}).")
+                else:
+                    if args.memory_growth:
+                        for gpu in gpus:
+                            tf.config.experimental.set_memory_growth(gpu, True)
+                    print(f"Warning: GPU {args.gpu} out of range (found {len(gpus)} GPUs). Using default GPU.")
+            except Exception as e:
+                print(f"Warning configuring GPU {args.gpu}: {e}")
+        else:
+            print("Set to use GPU for training (no physical GPU detected, fallback to CPU).")
+
+    # Load disease info
+    orphanet_excel = 'Orphanet_Names_filtered_2607.xlsx' if os.path.exists('Orphanet_Names_filtered_2607.xlsx') else 'Orphanet_Names_filtered_2604.xlsx'
+    print(f"Loading disease info from {orphanet_excel}...")
+    try:
+        d_info = pd.read_excel(orphanet_excel)
+    except Exception as e:
+        print(f"Failed to load {orphanet_excel}: {e}")
+        return
+
+    categories = ['del', 'dup'] if args.category == 'both' else [args.category]
+    for cat in categories:
+        train_for_category(args, cat, d_info)
 
 if __name__ == "__main__":
     main()
